@@ -1,6 +1,9 @@
 #include "detector.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <stdexcept>
 #include <iostream>
 
 YOLODetector::YOLODetector(
@@ -8,183 +11,218 @@ YOLODetector::YOLODetector(
     float confThreshold,
     float nmsThreshold
 )
-    : confThreshold(confThreshold),
-      nmsThreshold(nmsThreshold)
+    : env_(ORT_LOGGING_LEVEL_WARNING, "PiYOLO"),
+      session_(
+          env_,
+          modelPath.c_str(),
+          [] {
+              Ort::SessionOptions options;
+              options.SetIntraOpNumThreads(4);
+              options.SetGraphOptimizationLevel(
+                  GraphOptimizationLevel::ORT_ENABLE_ALL
+              );
+              return options;
+          }()
+      ),
+      memoryInfo_(
+          Ort::MemoryInfo::CreateCpu(
+              OrtArenaAllocator,
+              OrtMemTypeDefault
+          )
+      ),
+      confThreshold_(confThreshold),
+      nmsThreshold_(nmsThreshold),
+      classNames_({
+          "person", "bicycle", "car", "motorcycle", "airplane",
+          "bus", "train", "truck", "boat", "traffic light",
+          "fire hydrant", "stop sign", "parking meter", "bench",
+          "bird", "cat", "dog", "horse", "sheep", "cow",
+          "elephant", "bear", "zebra", "giraffe", "backpack",
+          "umbrella", "handbag", "tie", "suitcase", "frisbee",
+          "skis", "snowboard", "sports ball", "kite", "baseball bat",
+          "baseball glove", "skateboard", "surfboard", "tennis racket",
+          "bottle", "wine glass", "cup", "fork", "knife", "spoon",
+          "bowl", "banana", "apple", "sandwich", "orange", "broccoli",
+          "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+          "couch", "potted plant", "bed", "dining table", "toilet",
+          "tv", "laptop", "mouse", "remote", "keyboard", "cell phone",
+          "microwave", "oven", "toaster", "sink", "refrigerator",
+          "book", "clock", "vase", "scissors", "teddy bear",
+          "hair drier", "toothbrush"
+      })
 {
-    net = cv::dnn::readNetFromONNX(modelPath);
+    std::cerr << "[YOLO] Constructor body entered" << std::endl;
+    Ort::AllocatorWithDefaultOptions allocator;
 
-    if (net.empty()) {
-        throw std::runtime_error(
-            "Failed to load YOLO ONNX model: " + modelPath
-        );
+    std::cerr << "[YOLO] Getting input name" << std::endl;
+    auto input = session_.GetInputNameAllocated(0, allocator);
+    std::cerr << "[YOLO] Getting output name" << std::endl;
+    auto output = session_.GetOutputNameAllocated(0, allocator);
+
+    inputName_ = input.get();
+    outputName_ = output.get();
+
+    std::cerr << "[YOLO] Getting output type info" << std::endl;
+    auto outputTypeInfo = session_.GetOutputTypeInfo(0);
+
+    std::cerr << "[YOLO] Getting tensor shape info" << std::endl;
+    auto outputInfo = outputTypeInfo.GetTensorTypeAndShapeInfo();
+
+    std::cerr << "[YOLO] Getting shape dimensions" << std::endl;
+    const auto shape = outputInfo.GetShape();
+
+    std::cerr << "[YOLO] Shape dimensions count: "
+              << shape.size() << std::endl;
+
+    for (size_t i = 0; i < shape.size(); ++i) {
+        std::cerr << "[YOLO] shape[" << i << "] = "
+                  << shape[i] << std::endl;
     }
 
-    // 純 OpenCV CPU
-    net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-    net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
-
-    std::cout << "YOLO model loaded\n";
-    std::cout << "Backend: OpenCV\n";
-    std::cout << "Target: CPU\n";
+    if (shape.size() != 3 ||
+        shape[0] != 1 ||
+        shape[1] != 84 ||
+        shape[2] != 8400) {
+        throw std::runtime_error(
+            "Unexpected YOLOv8 output shape; expected [1,84,8400]"
+        );
+    }
 }
 
+const std::vector<std::string>& YOLODetector::classNames() const {
+    return classNames_;
+}
 
-std::vector<Detection> YOLODetector::detect(
-    const cv::Mat& frame
-)
-{
+std::vector<Detection> YOLODetector::detect(const cv::Mat& frame) {
     std::vector<Detection> detections;
 
     if (frame.empty()) {
         return detections;
     }
 
-    // 建立 DNN input
-    cv::Mat blob;
-
-    cv::dnn::blobFromImage(
+    // YOLOv8 expects RGB, normalized float32, NCHW.
+    // Resize directly to 640x640; boxes are scaled back below.
+    cv::Mat blob = cv::dnn::blobFromImage(
         frame,
-        blob,
         1.0 / 255.0,
-        cv::Size(inputWidth, inputHeight),
+        cv::Size(inputWidth_, inputHeight_),
         cv::Scalar(),
         true,
-        false
+        false,
+        CV_32F
     );
 
-    net.setInput(blob);
+    const std::array<int64_t, 4> inputShape = {
+        1, 3, inputHeight_, inputWidth_
+    };
 
-    cv::Mat output = net.forward();
+    Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
+        memoryInfo_,
+        reinterpret_cast<float*>(blob.data),
+        blob.total(),
+        inputShape.data(),
+        inputShape.size()
+    );
 
-    /*
-     * YOLOv5 ONNX 通常輸出：
-     *
-     * [x, y, width, height, confidence, classes...]
-     */
+    const char* inputNames[] = { inputName_.c_str() };
+    const char* outputNames[] = { outputName_.c_str() };
 
-    const int dimensions = output.size[2];
-    const int rows = output.size[1];
+    auto outputs = session_.Run(
+        Ort::RunOptions{nullptr},
+        inputNames,
+        &inputTensor,
+        1,
+        outputNames,
+        1
+    );
 
-    float* data = reinterpret_cast<float*>(output.data);
+    const float* data = outputs[0].GetTensorData<float>();
 
-    float xFactor =
-        static_cast<float>(frame.cols) / inputWidth;
+    // Output layout: [1, 84, 8400], channel-major.
+    constexpr int numClasses = 80;
+    constexpr int numCandidates = 8400;
 
-    float yFactor =
-        static_cast<float>(frame.rows) / inputHeight;
-
-    std::vector<int> classIds;
-    std::vector<float> confidences;
     std::vector<cv::Rect> boxes;
+    std::vector<float> scores;
+    std::vector<int> classIds;
 
-    for (int i = 0; i < rows; ++i) {
+    const float scaleX =
+        static_cast<float>(frame.cols) / inputWidth_;
+    const float scaleY =
+        static_cast<float>(frame.rows) / inputHeight_;
 
-        float* row = data + i * dimensions;
+    for (int i = 0; i < numCandidates; ++i) {
+        float bestScore = 0.0f;
+        int bestClass = -1;
 
-        float confidence = row[4];
+        for (int c = 0; c < numClasses; ++c) {
+            const float score =
+                data[(4 + c) * numCandidates + i];
 
-        if (confidence < confThreshold) {
+            if (score > bestScore) {
+                bestScore = score;
+                bestClass = c;
+            }
+        }
+
+        if (bestScore < confThreshold_ || bestClass < 0) {
             continue;
         }
 
-        cv::Mat scores(
-            1,
-            dimensions - 5,
-            CV_32FC1,
-            row + 5
-        );
+        const float cx = data[0 * numCandidates + i];
+        const float cy = data[1 * numCandidates + i];
+        const float w  = data[2 * numCandidates + i];
+        const float h  = data[3 * numCandidates + i];
 
-        cv::Point classIdPoint;
-        double maxClassScore;
+        int left = static_cast<int>((cx - w / 2.0f) * scaleX);
+        int top = static_cast<int>((cy - h / 2.0f) * scaleY);
+        int width = static_cast<int>(w * scaleX);
+        int height = static_cast<int>(h * scaleY);
 
-        cv::minMaxLoc(
-            scores,
-            nullptr,
-            &maxClassScore,
-            nullptr,
-            &classIdPoint
-        );
+        cv::Rect box(left, top, width, height);
+        box &= cv::Rect(0, 0, frame.cols, frame.rows);
 
-        double finalConfidence =
-            confidence * maxClassScore;
-
-        if (finalConfidence < confThreshold) {
+        if (box.width <= 0 || box.height <= 0) {
             continue;
         }
-
-        float cx = row[0];
-        float cy = row[1];
-        float w = row[2];
-        float h = row[3];
-
-        int left =
-            static_cast<int>(
-                (cx - w / 2.0f) * xFactor
-            );
-
-        int top =
-            static_cast<int>(
-                (cy - h / 2.0f) * yFactor
-            );
-
-        int width =
-            static_cast<int>(w * xFactor);
-
-        int height =
-            static_cast<int>(h * yFactor);
-
-        cv::Rect box(
-            left,
-            top,
-            width,
-            height
-        );
-
-        box &= cv::Rect(
-            0,
-            0,
-            frame.cols,
-            frame.rows
-        );
-
-        classIds.push_back(
-            classIdPoint.x
-        );
-
-        confidences.push_back(
-            static_cast<float>(finalConfidence)
-        );
 
         boxes.push_back(box);
+        scores.push_back(bestScore);
+        classIds.push_back(bestClass);
     }
 
-    // Non-Maximum Suppression
-    std::vector<int> indices;
+    // Apply NMS separately for each class.
+    for (int classId = 0; classId < numClasses; ++classId) {
+        std::vector<cv::Rect> classBoxes;
+        std::vector<float> classScores;
+        std::vector<int> originalIndices;
 
-    cv::dnn::NMSBoxes(
-        boxes,
-        confidences,
-        confThreshold,
-        nmsThreshold,
-        indices
-    );
+        for (size_t i = 0; i < boxes.size(); ++i) {
+            if (classIds[i] == classId) {
+                classBoxes.push_back(boxes[i]);
+                classScores.push_back(scores[i]);
+                originalIndices.push_back(static_cast<int>(i));
+            }
+        }
 
-    for (int index : indices) {
-
-        Detection detection;
-
-        detection.classId =
-            classIds[index];
-
-        detection.confidence =
-            confidences[index];
-
-        detection.box =
-            boxes[index];
-
-        detections.push_back(
-            detection
+        std::vector<int> kept;
+        cv::dnn::NMSBoxes(
+            classBoxes,
+            classScores,
+            confThreshold_,
+            nmsThreshold_,
+            kept
         );
+
+        for (int index : kept) {
+            const int original = originalIndices[index];
+
+            detections.push_back({
+                classIds[original],
+                scores[original],
+                boxes[original]
+            });
+        }
     }
 
     return detections;

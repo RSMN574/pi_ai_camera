@@ -3,6 +3,7 @@
 #include <libcamera/framebuffer_allocator.h>
 
 #include <opencv2/opencv.hpp>
+#include "detector.hpp"
 
 #include <sys/mman.h>
 
@@ -26,6 +27,10 @@ public:
 
     int run()
     {
+        std::cerr << "[DEBUG] Before YOLODetector" << std::endl;
+        YOLODetector detector("models/yolov8n.onnx", 0.40f, 0.45f);
+        std::cerr << "[DEBUG] YOLODetector created" << std::endl;
+
         int ret = cameraManager_.start();
 
         if (ret) {
@@ -333,6 +338,84 @@ public:
             if (frame.empty())
                 continue;
 
+            // YOLOv8 inference + performance statistics
+            static auto perfStart = std::chrono::steady_clock::now();
+            static int perfFrames = 0;
+            static double perfTotalMs = 0.0;
+
+            const auto inferStart = std::chrono::steady_clock::now();
+            std::vector<Detection> detections;
+
+            try {
+                detections = detector.detect(frame);
+            } catch (const std::exception& e) {
+                std::cerr << "[DEBUG] Inference failed: "
+                          << e.what() << std::endl;
+                running_ = false;
+                break;
+            }
+
+            const auto inferEnd = std::chrono::steady_clock::now();
+            const double inferMs =
+                std::chrono::duration<double, std::milli>(
+                    inferEnd - inferStart
+                ).count();
+
+            perfFrames++;
+            perfTotalMs += inferMs;
+
+            const double perfElapsed =
+                std::chrono::duration<double>(
+                    inferEnd - perfStart
+                ).count();
+
+            if (perfElapsed >= 1.0) {
+                std::cerr << "[PERF] Inference FPS: "
+                          << perfFrames / perfElapsed
+                          << " | Average inference: "
+                          << perfTotalMs / perfFrames
+                          << " ms"
+                          << std::endl;
+
+                perfFrames = 0;
+                perfTotalMs = 0.0;
+                perfStart = inferEnd;
+            }
+
+            for (const auto& detection : detections) {
+                cv::rectangle(
+                    frame,
+                    detection.box,
+                    cv::Scalar(0, 255, 0),
+                    2
+                );
+
+                std::string label = "class " +
+                    std::to_string(detection.classId);
+
+                const auto& names = detector.classNames();
+                if (detection.classId >= 0 &&
+                    detection.classId < static_cast<int>(names.size())) {
+                    label = names[detection.classId];
+                }
+
+                label += " " + std::to_string(
+                    static_cast<int>(detection.confidence * 100)
+                ) + "%";
+
+                const int textY = std::max(20, detection.box.y - 8);
+
+                cv::putText(
+                    frame,
+                    label,
+                    cv::Point(detection.box.x, textY),
+                    cv::FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    cv::Scalar(0, 255, 0),
+                    2
+                );
+            }
+
             frameCount++;
 
             auto now =
@@ -601,7 +684,16 @@ private:
 
 int main()
 {
-    CameraPreview preview;
-
-    return preview.run();
+    try {
+        CameraPreview preview;
+        return preview.run();
+    } catch (const Ort::Exception& e) {
+        std::cerr << "ONNX Runtime error: "
+                  << e.what() << std::endl;
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "Application error: "
+                  << e.what() << std::endl;
+        return 1;
+    }
 }

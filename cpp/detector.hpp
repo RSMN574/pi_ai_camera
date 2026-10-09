@@ -1,6 +1,8 @@
 #pragma once
 
+#include <onnxruntime_cxx_api.h>
 #include <opencv2/opencv.hpp>
+
 #include <string>
 #include <vector>
 
@@ -14,18 +16,26 @@ class YOLODetector {
 public:
     YOLODetector(
         const std::string& modelPath,
-        float confThreshold = 0.4f,
+        float confThreshold = 0.40f,
         float nmsThreshold = 0.45f
     );
 
     std::vector<Detection> detect(const cv::Mat& frame);
+    const std::vector<std::string>& classNames() const;
 
 private:
-    cv::dnn::Net net;
+    Ort::Env env_;
+    Ort::Session session_;
+    Ort::MemoryInfo memoryInfo_;
 
-    float confThreshold;
-    float nmsThreshold;
+    std::string inputName_;
+    std::string outputName_;
 
-    const int inputWidth = 640;
-    const int inputHeight = 640;
+    float confThreshold_;
+    float nmsThreshold_;
+
+    static constexpr int inputWidth_ = 640;
+    static constexpr int inputHeight_ = 640;
+
+    std::vector<std::string> classNames_;
 };
