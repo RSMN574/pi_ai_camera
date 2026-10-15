@@ -22,8 +22,8 @@ set(ONNXRUNTIME_ROOT
 add_executable(yolo_ort
     preview.cpp
     detector.cpp
+    object_tracker.cpp
 )
-
 target_include_directories(yolo_ort PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${ONNXRUNTIME_ROOT}/include

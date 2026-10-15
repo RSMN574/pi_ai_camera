@@ -3,39 +3,88 @@
 #include <libcamera/framebuffer_allocator.h>
 
 #include <opencv2/opencv.hpp>
+
 #include "detector.hpp"
+#include "object_tracker.hpp"
 
 #include <sys/mman.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <iostream>
 #include <memory>
-#include <vector>
 #include <mutex>
-#include <condition_variable>
-#include <chrono>
+#include <string>
+#include <vector>
 
 using namespace libcamera;
+
+namespace {
+
+constexpr const char* kWindowName = "Raspberry Pi Camera";
+
+std::mutex gClickMutex;
+cv::Point gClickedPoint(-1, -1);
+bool gClickPending = false;
+
+void onMouse(int event, int x, int y, int, void*)
+{
+    if (event != cv::EVENT_LBUTTONDOWN) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(gClickMutex);
+    gClickedPoint = cv::Point(x, y);
+    gClickPending = true;
+}
+
+bool takeClick(cv::Point& point)
+{
+    std::lock_guard<std::mutex> lock(gClickMutex);
+
+    if (!gClickPending) {
+        return false;
+    }
+
+    point = gClickedPoint;
+    gClickPending = false;
+    return true;
+}
+
+std::string classLabel(const Detection& detection,
+                       const std::vector<std::string>& names)
+{
+    std::string label = "class " + std::to_string(detection.classId);
+
+    if (detection.classId >= 0 &&
+        detection.classId < static_cast<int>(names.size())) {
+        label = names[static_cast<size_t>(detection.classId)];
+    }
+
+    label += " " + std::to_string(
+        static_cast<int>(detection.confidence * 100.0f)) + "%";
+
+    return label;
+}
+
+} // namespace
 
 class CameraPreview
 {
 public:
-    CameraPreview()
-        : running_(true),
-          frameReady_(false)
-    {
-    }
+    CameraPreview() = default;
 
     int run()
     {
-        std::cerr << "[DEBUG] Before YOLODetector" << std::endl;
+        std::cerr << "[INFO] Loading YOLOv8n model..." << std::endl;
         YOLODetector detector("models/yolov8n.onnx", 0.40f, 0.45f);
-        std::cerr << "[DEBUG] YOLODetector created" << std::endl;
+        std::cerr << "[INFO] YOLOv8n model loaded." << std::endl;
 
         int ret = cameraManager_.start();
-
         if (ret) {
-            std::cerr << "CameraManager start failed: "
-                      << ret << std::endl;
+            std::cerr << "CameraManager start failed: " << ret << std::endl;
             return ret;
         }
 
@@ -46,57 +95,36 @@ public:
         }
 
         camera_ = cameraManager_.cameras()[0];
-
-        std::cout << "Using camera: "
-                  << camera_->id() << std::endl;
+        std::cout << "Using camera: " << camera_->id() << std::endl;
 
         ret = camera_->acquire();
-
         if (ret) {
-            std::cerr << "Camera acquire failed: "
-                      << ret << std::endl;
-
+            std::cerr << "Camera acquire failed: " << ret << std::endl;
             cameraManager_.stop();
             return ret;
         }
 
-        /*
-         * 建立 Viewfinder
-         */
-        config_ = camera_->generateConfiguration({
-            StreamRole::Viewfinder
-        });
-
+        config_ = camera_->generateConfiguration({ StreamRole::Viewfinder });
         if (!config_) {
-            std::cerr << "Failed to generate configuration"
-                      << std::endl;
-
+            std::cerr << "Failed to generate camera configuration" << std::endl;
             cleanup();
             return -1;
         }
 
         streamConfig_ = &config_->at(0);
-
         streamConfig_->size = Size(640, 480);
         streamConfig_->pixelFormat = formats::RGB888;
 
-        CameraConfiguration::Status validation =
-            config_->validate();
-
+        const CameraConfiguration::Status validation = config_->validate();
         if (validation == CameraConfiguration::Invalid) {
-            std::cerr << "Invalid camera configuration"
-                      << std::endl;
-
+            std::cerr << "Invalid camera configuration" << std::endl;
             cleanup();
             return -1;
         }
 
         ret = camera_->configure(config_.get());
-
         if (ret) {
-            std::cerr << "Camera configure failed: "
-                      << ret << std::endl;
-
+            std::cerr << "Camera configure failed: " << ret << std::endl;
             cleanup();
             return ret;
         }
@@ -104,583 +132,432 @@ public:
         stream_ = streamConfig_->stream();
 
         std::cout << "Resolution: "
-                  << streamConfig_->size.width
-                  << "x"
-                  << streamConfig_->size.height
+                  << streamConfig_->size.width << "x"
+                  << streamConfig_->size.height << std::endl;
+        std::cout << "Format: " << streamConfig_->pixelFormat.toString()
                   << std::endl;
 
-        std::cout << "Format: "
-                  << streamConfig_->pixelFormat.toString()
-                  << std::endl;
-
-        /*
-         * FrameBuffer
-         */
-        allocator_ =
-            std::make_unique<FrameBufferAllocator>(camera_);
-
+        allocator_ = std::make_unique<FrameBufferAllocator>(camera_);
         ret = allocator_->allocate(stream_);
-
         if (ret < 0) {
-            std::cerr << "FrameBuffer allocation failed: "
-                      << ret << std::endl;
-
+            std::cerr << "FrameBuffer allocation failed: " << ret << std::endl;
             cleanup();
             return ret;
         }
 
-        const auto &buffers =
-            allocator_->buffers(stream_);
+        const auto& buffers = allocator_->buffers(stream_);
+        std::cout << "Buffers: " << buffers.size() << std::endl;
 
-        std::cout << "Buffers: "
-                  << buffers.size()
-                  << std::endl;
+        mappedBuffers_.reserve(buffers.size());
 
-        /*
-         * mmap 每個 buffer
-         */
-        for (const auto &buffer : buffers) {
+        for (const auto& buffer : buffers) {
+            // Add the entry first so cleanup can unmap already-mapped planes
+            // if a later mmap call fails.
+            mappedBuffers_.emplace_back();
+            auto& mapped = mappedBuffers_.back();
 
-            std::vector<MappedPlane> mapped;
-
-            for (const auto &plane : buffer->planes()) {
-
-                void *data = mmap(
-                    nullptr,
-                    plane.length,
-                    PROT_READ,
-                    MAP_SHARED,
-                    plane.fd.get(),
-                    plane.offset
-                );
+            for (const auto& plane : buffer->planes()) {
+                void* data = mmap(nullptr,
+                                  plane.length,
+                                  PROT_READ,
+                                  MAP_SHARED,
+                                  plane.fd.get(),
+                                  plane.offset);
 
                 if (data == MAP_FAILED) {
-
-                    std::cerr << "mmap failed"
-                              << std::endl;
-
+                    std::cerr << "mmap failed" << std::endl;
                     cleanup();
                     return -1;
                 }
 
-                mapped.push_back({
-                    data,
-                    plane.length
-                });
+                mapped.push_back({ data, plane.length });
             }
-
-            mappedBuffers_.push_back(
-                std::move(mapped)
-            );
         }
 
-        /*
-         * 重要：
-         * libcamera 0.5.2 不接受 lambda。
-         *
-         * 使用 class member function。
-         */
-        camera_->requestCompleted.connect(
-            this,
-            &CameraPreview::requestComplete
-        );
+        camera_->requestCompleted.connect(this, &CameraPreview::requestComplete);
 
-        /*
-         * 建立 Requests
-         */
-        for (const auto &buffer : buffers) {
-
-            std::unique_ptr<Request> request =
-                camera_->createRequest();
-
+        for (const auto& buffer : buffers) {
+            std::unique_ptr<Request> request = camera_->createRequest();
             if (!request) {
-
-                std::cerr
-                    << "Failed to create request"
-                    << std::endl;
-
+                std::cerr << "Failed to create request" << std::endl;
                 cleanup();
                 return -1;
             }
 
-            ret = request->addBuffer(
-                stream_,
-                buffer.get()
-            );
-
+            ret = request->addBuffer(stream_, buffer.get());
             if (ret < 0) {
-
-                std::cerr
-                    << "Failed to add buffer"
-                    << std::endl;
-
+                std::cerr << "Failed to add buffer: " << ret << std::endl;
                 cleanup();
                 return ret;
             }
 
-            requests_.push_back(
-                std::move(request)
-            );
+            requests_.push_back(std::move(request));
         }
 
-        /*
-         * 啟動 camera
-         */
         ret = camera_->start();
-
         if (ret) {
-
-            std::cerr
-                << "Camera start failed: "
-                << ret
-                << std::endl;
-
+            std::cerr << "Camera start failed: " << ret << std::endl;
             cleanup();
             return ret;
         }
+        cameraStarted_ = true;
+        running_.store(true);
 
-        /*
-         * Queue 所有 request
-         */
-        for (auto &request : requests_) {
-
-            ret = camera_->queueRequest(
-                request.get()
-            );
-
+        for (auto& request : requests_) {
+            ret = camera_->queueRequest(request.get());
             if (ret < 0) {
-
-                std::cerr
-                    << "Failed to queue request: "
-                    << ret
-                    << std::endl;
-
-                running_ = false;
-
+                std::cerr << "Failed to queue request: " << ret << std::endl;
+                running_.store(false);
+                condition_.notify_all();
                 camera_->stop();
-
+                cameraStarted_ = false;
                 cleanup();
-
                 return ret;
             }
         }
 
-        std::cout << std::endl;
-        std::cout
-            << "============================"
-            << std::endl;
+        std::cout << "\n====================================\n"
+                  << " Raspberry Pi Camera + YOLOv8n + KCF\n"
+                  << " Left click: select a detected object\n"
+                  << " R: reset / select another object\n"
+                  << " Q: quit\n"
+                  << "====================================\n";
 
-        std::cout
-            << " IMX219 C++ Preview"
-            << std::endl;
+        cv::namedWindow(kWindowName, cv::WINDOW_NORMAL);
+        cv::resizeWindow(kWindowName, 640, 480);
+        cv::setMouseCallback(kWindowName, onMouse);
 
-        std::cout
-            << " 640x480"
-            << std::endl;
-
-        std::cout
-            << " Press Q to quit"
-            << std::endl;
-
-        std::cout
-            << "============================"
-            << std::endl;
-
-        /*
-         * OpenCV 視窗
-         */
-        cv::namedWindow(
-            "Raspberry Pi Camera",
-            cv::WINDOW_NORMAL
-        );
-
-        cv::resizeWindow(
-            "Raspberry Pi Camera",
-            640,
-            480
-        );
+        ObjectTracker tracker;
+        std::vector<Detection> detections;
 
         int frameCount = 0;
+        double displayFps = 0.0;
+        auto lastFpsTime = std::chrono::steady_clock::now();
 
-        double fps = 0;
+        int inferenceFrames = 0;
+        double inferenceTotalMs = 0.0;
+        auto inferenceStatsStart = std::chrono::steady_clock::now();
 
-        auto lastTime =
-            std::chrono::steady_clock::now();
+        int exitCode = 0;
 
-        /*
-         * 主迴圈
-         */
-        while (running_) {
-
+        while (running_.load()) {
             cv::Mat frame;
 
             {
-                std::unique_lock<std::mutex> lock(
-                    mutex_
-                );
+                std::unique_lock<std::mutex> lock(mutex_);
+                condition_.wait(lock, [this]() {
+                    return frameReady_ || !running_.load();
+                });
 
-                condition_.wait(
-                    lock,
-                    [this]() {
-                        return frameReady_
-                            || !running_;
-                    }
-                );
-
-                if (!running_)
+                if (!running_.load()) {
                     break;
+                }
 
                 frame = latestFrame_.clone();
-
                 frameReady_ = false;
             }
 
-            if (frame.empty())
+            if (frame.empty()) {
                 continue;
-
-            // YOLOv8 inference + performance statistics
-            static auto perfStart = std::chrono::steady_clock::now();
-            static int perfFrames = 0;
-            static double perfTotalMs = 0.0;
-
-            const auto inferStart = std::chrono::steady_clock::now();
-            std::vector<Detection> detections;
-
-            try {
-                detections = detector.detect(frame);
-            } catch (const std::exception& e) {
-                std::cerr << "[DEBUG] Inference failed: "
-                          << e.what() << std::endl;
-                running_ = false;
-                break;
             }
 
-            const auto inferEnd = std::chrono::steady_clock::now();
-            const double inferMs =
-                std::chrono::duration<double, std::milli>(
-                    inferEnd - inferStart
-                ).count();
+            // YOLO runs only while waiting for a selection. KCF handles
+            // frame-to-frame tracking after the user selects a detection.
+            if (tracker.state() == TrackingState::WAITING) {
+                const auto inferStart = std::chrono::steady_clock::now();
 
-            perfFrames++;
-            perfTotalMs += inferMs;
-
-            const double perfElapsed =
-                std::chrono::duration<double>(
-                    inferEnd - perfStart
-                ).count();
-
-            if (perfElapsed >= 1.0) {
-                std::cerr << "[PERF] Inference FPS: "
-                          << perfFrames / perfElapsed
-                          << " | Average inference: "
-                          << perfTotalMs / perfFrames
-                          << " ms"
-                          << std::endl;
-
-                perfFrames = 0;
-                perfTotalMs = 0.0;
-                perfStart = inferEnd;
-            }
-
-            for (const auto& detection : detections) {
-                cv::rectangle(
-                    frame,
-                    detection.box,
-                    cv::Scalar(0, 255, 0),
-                    2
-                );
-
-                std::string label = "class " +
-                    std::to_string(detection.classId);
-
-                const auto& names = detector.classNames();
-                if (detection.classId >= 0 &&
-                    detection.classId < static_cast<int>(names.size())) {
-                    label = names[detection.classId];
+                try {
+                    detections = detector.detect(frame);
+                } catch (const std::exception& e) {
+                    std::cerr << "[ERROR] YOLO inference failed: "
+                              << e.what() << std::endl;
+                    exitCode = 1;
+                    running_.store(false);
+                    break;
                 }
 
-                label += " " + std::to_string(
-                    static_cast<int>(detection.confidence * 100)
-                ) + "%";
+                const auto inferEnd = std::chrono::steady_clock::now();
+                const double inferMs =
+                    std::chrono::duration<double, std::milli>(
+                        inferEnd - inferStart).count();
 
-                const int textY = std::max(20, detection.box.y - 8);
+                ++inferenceFrames;
+                inferenceTotalMs += inferMs;
 
-                cv::putText(
-                    frame,
-                    label,
-                    cv::Point(detection.box.x, textY),
-                    cv::FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    cv::Scalar(0, 255, 0),
-                    2
-                );
+                const double inferElapsed =
+                    std::chrono::duration<double>(
+                        inferEnd - inferenceStatsStart).count();
+
+                if (inferElapsed >= 1.0) {
+                    std::cerr << "[PERF] YOLO FPS: "
+                              << inferenceFrames / inferElapsed
+                              << " | average inference: "
+                              << inferenceTotalMs / inferenceFrames
+                              << " ms" << std::endl;
+
+                    inferenceFrames = 0;
+                    inferenceTotalMs = 0.0;
+                    inferenceStatsStart = inferEnd;
+                }
+            } else if (tracker.state() == TrackingState::TRACKING) {
+                if (!tracker.update(frame)) {
+                    std::cerr << "[INFO] Target lost. Last box retained; "
+                                 "press R to select again."
+                              << std::endl;
+                }
             }
 
-            frameCount++;
+            cv::Mat display = frame.clone();
 
-            auto now =
-                std::chrono::steady_clock::now();
+            if (tracker.state() == TrackingState::WAITING) {
+                for (const auto& detection : detections) {
+                    cv::rectangle(display, detection.box,
+                                  cv::Scalar(0, 255, 0), 2);
 
-            double elapsed =
-                std::chrono::duration<double>(
-                    now - lastTime
-                ).count();
+                    cv::putText(display,
+                                classLabel(detection, detector.classNames()),
+                                cv::Point(detection.box.x,
+                                          std::max(20, detection.box.y - 8)),
+                                cv::FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                cv::Scalar(0, 255, 0),
+                                1);
+                }
+
+                cv::putText(display, "Click a detection to track",
+                            cv::Point(10, 26), cv::FONT_HERSHEY_SIMPLEX,
+                            0.6, cv::Scalar(0, 255, 255), 2);
+
+                cv::Point click;
+                if (takeClick(click)) {
+                    bool selected = false;
+
+                    // If boxes overlap, choose the smallest containing box,
+                    // which is usually the more specific target.
+                    const Detection* chosen = nullptr;
+                    for (const auto& detection : detections) {
+                        if (detection.box.contains(click) &&
+                            (!chosen ||
+                             detection.box.area() < chosen->box.area())) {
+                            chosen = &detection;
+                        }
+                    }
+
+                    if (chosen) {
+                        selected = tracker.select(
+                            frame, chosen->box, chosen->classId);
+
+                        if (selected) {
+                            std::cout << "[INFO] Tracking selected object: "
+                                      << classLabel(*chosen,
+                                                    detector.classNames())
+                                      << std::endl;
+                        } else {
+                            std::cerr << "[WARN] Could not initialize KCF "
+                                         "for this detection."
+                                      << std::endl;
+                        }
+                    } else {
+                        std::cout << "[INFO] Click was not inside a detection "
+                                     "box; click a green box."
+                                  << std::endl;
+                    }
+                }
+            } else if (tracker.state() == TrackingState::TRACKING) {
+                const cv::Rect& box = tracker.box();
+                cv::rectangle(display, box, cv::Scalar(255, 180, 0), 2);
+
+                std::string label = "TRACKING";
+                const int classId = tracker.classId();
+                const auto& names = detector.classNames();
+                if (classId >= 0 && classId < static_cast<int>(names.size())) {
+                    label += ": " + names[static_cast<size_t>(classId)];
+                }
+
+                cv::putText(display, label,
+                            cv::Point(box.x, std::max(20, box.y - 8)),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                            cv::Scalar(255, 180, 0), 2);
+            } else {
+                const cv::Rect& lastBox = tracker.lastBox();
+                if (lastBox.width > 0 && lastBox.height > 0) {
+                    cv::rectangle(display, lastBox,
+                                  cv::Scalar(0, 0, 255), 2);
+                }
+
+                cv::putText(display, "TARGET LOST - Press R to reset",
+                            cv::Point(10, 26), cv::FONT_HERSHEY_SIMPLEX,
+                            0.6, cv::Scalar(0, 0, 255), 2);
+            }
+
+            ++frameCount;
+            const auto now = std::chrono::steady_clock::now();
+            const double elapsed =
+                std::chrono::duration<double>(now - lastFpsTime).count();
 
             if (elapsed >= 1.0) {
-
-                fps =
-                    frameCount / elapsed;
-
+                displayFps = frameCount / elapsed;
                 frameCount = 0;
-
-                lastTime = now;
+                lastFpsTime = now;
             }
 
-            cv::putText(
-                frame,
-                "FPS: " +
-                    std::to_string(
-                        static_cast<int>(fps)
-                    ),
-                cv::Point(10, 30),
-                cv::FONT_HERSHEY_SIMPLEX,
-                0.8,
-                cv::Scalar(0, 255, 0),
-                2
-            );
+            cv::putText(display,
+                        "FPS: " + std::to_string(
+                            static_cast<int>(displayFps)),
+                        cv::Point(10, 56),
+                        cv::FONT_HERSHEY_SIMPLEX,
+                        0.7, cv::Scalar(0, 255, 0), 2);
 
-            cv::imshow(
-                "Raspberry Pi Camera",
-                frame
-            );
+            cv::imshow(kWindowName, display);
 
-            int key = cv::waitKey(1);
-
-            if (key == 'q' ||
-                key == 'Q') {
-
-                running_ = false;
+            const int key = cv::waitKey(1) & 0xFF;
+            if (key == 'q' || key == 'Q' || key == 27) {
+                running_.store(false);
+                condition_.notify_all();
                 break;
+            }
+
+            if (key == 'r' || key == 'R') {
+                tracker.reset();
+                detections.clear();
+                {
+                    std::lock_guard<std::mutex> lock(gClickMutex);
+                    gClickPending = false;
+                }
+                std::cout << "[INFO] Tracker reset. Select an object again."
+                          << std::endl;
             }
         }
 
-        running_ = false;
+        running_.store(false);
+        condition_.notify_all();
 
-        /*
-         * 停止 camera
-         */
-        camera_->stop();
+        if (cameraStarted_ && camera_) {
+            camera_->stop();
+            cameraStarted_ = false;
+        }
 
         cv::destroyAllWindows();
-
         cleanup();
-
-        return 0;
+        return exitCode;
     }
 
 private:
-
-    struct MappedPlane
-    {
-        void *data;
-        size_t length;
+    struct MappedPlane {
+        void* data = nullptr;
+        size_t length = 0;
     };
 
-    /*
-     * 這就是 libcamera Signal 要求的
-     * member function。
-     */
-    void requestComplete(Request *request)
+    void requestComplete(Request* request)
     {
-        if (!running_)
-            return;
-
-        if (request->status() ==
-            Request::RequestCancelled) {
-
+        if (request->status() == Request::RequestCancelled) {
             return;
         }
 
-        const auto &buffers =
-            request->buffers();
-
-        auto it =
-            buffers.find(stream_);
-
-        if (it == buffers.end())
+        const auto buffers = request->buffers();
+        const auto it = buffers.find(stream_);
+        if (it == buffers.end()) {
+            requeueRequest(request);
             return;
+        }
 
-        FrameBuffer *buffer =
-            it->second;
+        FrameBuffer* buffer = it->second;
+        const auto& allocatedBuffers = allocator_->buffers(stream_);
 
-        /*
-         * 找 buffer index
-         */
-        const auto &allocatedBuffers =
-            allocator_->buffers(stream_);
-
-        size_t index = 0;
-
-        for (size_t i = 0;
-             i < allocatedBuffers.size();
-             ++i) {
-
-            if (allocatedBuffers[i].get()
-                == buffer) {
-
+        size_t index = allocatedBuffers.size();
+        for (size_t i = 0; i < allocatedBuffers.size(); ++i) {
+            if (allocatedBuffers[i].get() == buffer) {
                 index = i;
                 break;
             }
         }
 
-        if (index >= mappedBuffers_.size())
+        if (index >= mappedBuffers_.size() ||
+            mappedBuffers_[index].empty()) {
+            requeueRequest(request);
             return;
-
-        if (mappedBuffers_[index].empty())
-            return;
-
-        void *data =
-            mappedBuffers_[index][0].data;
-
-        /*
-         * RGB888 → OpenCV
-         */
-        cv::Mat rgb(
-            480,
-            640,
-            CV_8UC3,
-            data,
-            streamConfig_->stride
-        );
-
-        cv::Mat bgr;
-
-        cv::cvtColor(
-            rgb,
-            bgr,
-            cv::COLOR_RGB2BGR
-        );
-
-        /*
-         * 複製到自己的 buffer
-         */
-        {
-            std::lock_guard<std::mutex> lock(
-                mutex_
-            );
-
-            latestFrame_ =
-                bgr.clone();
-
-            frameReady_ = true;
         }
 
+        void* data = mappedBuffers_[index][0].data;
+        cv::Mat bgr;
+
+        try {
+            cv::Mat rgb(480, 640, CV_8UC3,
+                        data, streamConfig_->stride);
+            cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+        } catch (const cv::Exception& e) {
+            std::cerr << "[WARN] Frame conversion failed: "
+                      << e.what() << std::endl;
+            requeueRequest(request);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            latestFrame_ = bgr.clone();
+            frameReady_ = true;
+        }
         condition_.notify_one();
 
-          /*
- * Request 已經完成，必須先重設狀態
- * 才能再次 queue。
- */
-if (running_) {
-    request->reuse(Request::ReuseBuffers);
-
-    int ret = camera_->queueRequest(request);
-
-    if (ret < 0) {
-        std::cerr
-            << "Failed to requeue request: "
-            << ret
-            << std::endl;
+        requeueRequest(request);
     }
-}        
 
+    void requeueRequest(Request* request)
+    {
+        if (!running_.load() || !camera_) {
+            return;
+        }
 
+        request->reuse(Request::ReuseBuffers);
+        const int ret = camera_->queueRequest(request);
+
+        if (ret < 0) {
+            std::cerr << "[ERROR] Failed to requeue request: "
+                      << ret << std::endl;
+        }
     }
 
     void cleanup()
     {
-        /*
-         * unmap
-         */
-        for (auto &buffer :
-             mappedBuffers_) {
-
-            for (auto &plane :
-                 buffer) {
-
+        for (auto& buffer : mappedBuffers_) {
+            for (auto& plane : buffer) {
                 if (plane.data) {
-
-                    munmap(
-                        plane.data,
-                        plane.length
-                    );
+                    munmap(plane.data, plane.length);
+                    plane.data = nullptr;
                 }
             }
         }
-
         mappedBuffers_.clear();
 
-        /*
-         * 注意：
-         *
-         * FrameBufferAllocator
-         * 沒有 release()。
-         *
-         * unique_ptr destructor
-         * 會自動清理。
-         */
         allocator_.reset();
-
         requests_.clear();
 
         if (camera_) {
-
             camera_->release();
-
             camera_.reset();
         }
 
         cameraManager_.stop();
+        streamConfig_ = nullptr;
+        stream_ = nullptr;
     }
 
-private:
-
     CameraManager cameraManager_;
-
     std::shared_ptr<Camera> camera_;
-
-    std::unique_ptr<CameraConfiguration>
-        config_;
-
-    StreamConfiguration *
-        streamConfig_ = nullptr;
-
-    Stream *
-        stream_ = nullptr;
-
-    std::unique_ptr<FrameBufferAllocator>
-        allocator_;
-
-    std::vector<std::unique_ptr<Request>>
-        requests_;
-
-    std::vector<
-        std::vector<MappedPlane>
-    >
-        mappedBuffers_;
+    std::unique_ptr<CameraConfiguration> config_;
+    StreamConfiguration* streamConfig_ = nullptr;
+    Stream* stream_ = nullptr;
+    std::unique_ptr<FrameBufferAllocator> allocator_;
+    std::vector<std::unique_ptr<Request>> requests_;
+    std::vector<std::vector<MappedPlane>> mappedBuffers_;
 
     cv::Mat latestFrame_;
-
     std::mutex mutex_;
-
-    std::condition_variable
-        condition_;
-
-    bool running_;
-
-    bool frameReady_;
+    std::condition_variable condition_;
+    std::atomic<bool> running_{false};
+    bool frameReady_ = false;
+    bool cameraStarted_ = false;
 };
-
 
 int main()
 {
@@ -688,12 +565,10 @@ int main()
         CameraPreview preview;
         return preview.run();
     } catch (const Ort::Exception& e) {
-        std::cerr << "ONNX Runtime error: "
-                  << e.what() << std::endl;
+        std::cerr << "ONNX Runtime error: " << e.what() << std::endl;
         return 1;
     } catch (const std::exception& e) {
-        std::cerr << "Application error: "
-                  << e.what() << std::endl;
+        std::cerr << "Application error: " << e.what() << std::endl;
         return 1;
     }
 }
